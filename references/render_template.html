@@ -12,8 +12,10 @@
 <body>
   <div id="root"></div>
 
-  <script type="module">
-    import { exportToSvg } from "https://esm.sh/@excalidraw/excalidraw?bundle";
+  <script src="/excalidraw.bundle.js"></script>
+  <script>
+    // ExcalidrawLib.exportToSvg is exposed by the IIFE bundle above
+    const { exportToSvg } = window.ExcalidrawLib;
 
     window.renderDiagram = async function(jsonData) {
       try {

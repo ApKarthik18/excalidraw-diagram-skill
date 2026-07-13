@@ -2,3 +2,6 @@
 *.png
 uv.lock
 __pycache__/
+# Generated JavaScript dependencies and bundle
+references/node_modules/
+references/excalidraw.bundle.js

@@ -120,51 +120,91 @@ def render(
         print(f"ERROR: Template not found at {template_path}", file=sys.stderr)
         sys.exit(1)
 
-    template_url = template_path.as_uri()
+    # Serve the template via a local HTTP server.
+    # Loading via file:// makes Chrome block cross-origin ES module imports (esm.sh),
+    # which prevents window.__moduleReady from ever firing.  Serving from localhost
+    # treats the page as a normal web origin and lets the import through.
+    import http.server
+    import socket
+    import threading
 
-    with sync_playwright() as p:
-        try:
-            browser = p.chromium.launch(headless=True)
-        except Exception as e:
-            if "Executable doesn't exist" in str(e) or "browserType.launch" in str(e):
-                print("ERROR: Chromium not installed for Playwright.", file=sys.stderr)
-                print("Run: cd .claude/skills/excalidraw-diagram/references && uv run playwright install chromium", file=sys.stderr)
+    def _pick_free_port() -> int:
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    serve_dir = str(template_path.parent)
+
+    class _SilentHandler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=serve_dir, **kwargs)
+        def log_message(self, *args):
+            pass  # suppress request log noise
+
+    port = _pick_free_port()
+    httpd = http.server.HTTPServer(("127.0.0.1", port), _SilentHandler)
+    server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    server_thread.start()
+
+    template_url = f"http://127.0.0.1:{port}/render_template.html"
+
+    try:
+        with sync_playwright() as p:
+            try:
+                browser = p.chromium.launch(headless=True)
+            except Exception as e:
+                if "Executable doesn't exist" in str(e) or "browserType.launch" in str(e):
+                    print("ERROR: Chromium not installed for Playwright.", file=sys.stderr)
+                    print("Run: cd .claude/skills/excalidraw-diagram/references && uv run playwright install chromium", file=sys.stderr)
+                    sys.exit(1)
+                raise
+
+            page = browser.new_page(
+                viewport={"width": vp_width, "height": vp_height},
+                device_scale_factor=scale,
+            )
+
+            # Capture browser console messages and errors for diagnostics
+            console_messages: list[str] = []
+            page.on("console", lambda msg: console_messages.append(f"[{msg.type}] {msg.text}"))
+            page.on("pageerror", lambda err: console_messages.append(f"[pageerror] {err}"))
+
+            # Load the template
+            page.goto(template_url)
+
+            # Wait for the ES module to load (imports from esm.sh); give 60s for first load
+            try:
+                page.wait_for_function("window.__moduleReady === true", timeout=60000)
+            except Exception as wait_err:
+                print("Browser console output:", file=sys.stderr)
+                for line in console_messages:
+                    print(f"  {line}", file=sys.stderr)
+                raise
+
+            # Inject the diagram data and render
+            json_str = json.dumps(data)
+            result = page.evaluate(f"window.renderDiagram({json_str})")
+
+            if not result or not result.get("success"):
+                error_msg = result.get("error", "Unknown render error") if result else "renderDiagram returned null"
+                print(f"ERROR: Render failed: {error_msg}", file=sys.stderr)
+                browser.close()
                 sys.exit(1)
-            raise
 
-        page = browser.new_page(
-            viewport={"width": vp_width, "height": vp_height},
-            device_scale_factor=scale,
-        )
+            # Wait for render completion signal
+            page.wait_for_function("window.__renderComplete === true", timeout=15000)
 
-        # Load the template
-        page.goto(template_url)
+            # Screenshot the SVG element
+            svg_el = page.query_selector("#root svg")
+            if svg_el is None:
+                print("ERROR: No SVG element found after render.", file=sys.stderr)
+                browser.close()
+                sys.exit(1)
 
-        # Wait for the ES module to load (imports from esm.sh)
-        page.wait_for_function("window.__moduleReady === true", timeout=30000)
-
-        # Inject the diagram data and render
-        json_str = json.dumps(data)
-        result = page.evaluate(f"window.renderDiagram({json_str})")
-
-        if not result or not result.get("success"):
-            error_msg = result.get("error", "Unknown render error") if result else "renderDiagram returned null"
-            print(f"ERROR: Render failed: {error_msg}", file=sys.stderr)
+            svg_el.screenshot(path=str(output_path))
             browser.close()
-            sys.exit(1)
-
-        # Wait for render completion signal
-        page.wait_for_function("window.__renderComplete === true", timeout=15000)
-
-        # Screenshot the SVG element
-        svg_el = page.query_selector("#root svg")
-        if svg_el is None:
-            print("ERROR: No SVG element found after render.", file=sys.stderr)
-            browser.close()
-            sys.exit(1)
-
-        svg_el.screenshot(path=str(output_path))
-        browser.close()
+    finally:
+        httpd.shutdown()
 
     return output_path
 
